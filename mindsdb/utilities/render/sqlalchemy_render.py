@@ -14,10 +14,19 @@ from sqlalchemy.sql import functions as sa_fnc
 from mindsdb_sql_parser import ast
 
 
+RESERVED_WORDS = {
+    "collation"
+}
+
 sa_type_names = [
     key for key, val in sa.types.__dict__.items() if hasattr(val, '__module__')
     and val.__module__ in ('sqlalchemy.sql.sqltypes', 'sqlalchemy.sql.type_api')
 ]
+
+types_map = {}
+for type_name in sa_type_names:
+    types_map[type_name.upper()] = getattr(sa.types, type_name)
+types_map['BOOL'] = types_map['BOOLEAN']
 
 
 class RenderError(Exception):
@@ -76,11 +85,6 @@ class SqlalchemyRender:
             # update version for support float cast
             self.dialect.server_version_info = (8, 0, 17)
 
-        self.types_map = {}
-        for type_name in sa_type_names:
-            self.types_map[type_name.upper()] = getattr(sa.types, type_name)
-        self.types_map['BOOL'] = self.types_map['BOOLEAN']
-
     def to_column(self, parts):
         # because sqlalchemy doesn't allow columns consist from parts therefore we do it manually
 
@@ -98,7 +102,7 @@ class SqlalchemyRender:
                     #   in that case use origin string
 
                     part_lower = str(sa.column(i.lower()).compile(dialect=self.dialect))
-                    if part.lower() != part_lower:
+                    if part.lower() != part_lower and i.lower() not in RESERVED_WORDS:
                         part = i
 
             parts2.append(part)
@@ -270,10 +274,38 @@ class SqlalchemyRender:
                         col0 = col0.desc()
                     order_by.append(col0)
 
+            rows, range_ = None, None
+            if t.modifier is not None:
+                words = t.modifier.lower().split()
+                if words[1] == 'between' and words[4] == 'and':
+                    # frame options
+                    # rows/groups BETWEEN <> <> AND <> <>
+                    # https://docs.sqlalchemy.org/en/20/core/sqlelement.html#sqlalchemy.sql.expression.over
+                    items = []
+                    for word1, word2 in (words[2:4], words[5:7]):
+                        if word1 == 'unbounded':
+                            items.append(None)
+                        elif (word1, word2) == ('current', 'row'):
+                            items.append(0)
+                        elif word1.isdigits():
+                            val = int(word1)
+                            if word2 == 'preceding':
+                                val = -val
+                            elif word2 != 'following':
+                                continue
+                            items.append(val)
+                    if len(items) == 2:
+                        if words[0] == 'rows':
+                            rows = tuple(items)
+                        elif words[0] == 'range':
+                            range_ = tuple(items)
+
             col = sa.over(
                 func,
                 partition_by=partition,
-                order_by=order_by
+                order_by=order_by,
+                range_=range_,
+                rows=rows
             )
 
             if t.alias:
@@ -363,8 +395,8 @@ class SqlalchemyRender:
             typename = 'BIGINT'
         if re.match(r'^FLOAT[\d]*$', typename):
             typename = 'FLOAT'
-        type = self.types_map[typename]
-        return type
+
+        return types_map[typename]
 
     def prepare_join(self, join):
         # join tree to table list
@@ -478,6 +510,8 @@ class SqlalchemyRender:
                             condition = self.to_expression(item['condition'])
 
                         join_type = item['join_type']
+                        if 'ASOF' in join_type:
+                            raise NotImplementedError(f'Unsupported join type: {join_type}')
                         method = 'join'
                         is_full = False
                         if join_type == 'LEFT JOIN':
